@@ -1,0 +1,293 @@
+
+# ============================================================
+# Corporate Strategy Analysis + Revenue Forecast (3 scénarios)
+# Entreprise : STMicroelectronics
+# Compatible Google Colab
+# ============================================================
+
+!pip -q install yfinance wordcloud
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# Optionnel (mais demandé "use colors")
+import seaborn as sns
+sns.set_theme(style="whitegrid")
+
+from wordcloud import WordCloud
+
+# -----------------------------
+# Section 1 : Introduction
+# -----------------------------
+print("# Analyse de Stratégie Corporate : STMicroelectronics")
+print("## Objectif")
+print("Ce notebook propose :")
+print("- Une lecture 'strategy' (marché, forces concurrentielles, SWOT, recommandations)")
+print("- Une prévision de chiffre d'affaires (revenues) à 5 ans en 3 scénarios : pessimiste / neutre / optimiste")
+print("\n⚠️ Note : les données peuvent être partielles via Yahoo Finance. En cas d’échec, un jeu d’exemple est utilisé.\n")
+
+
+# -----------------------------
+# Section 2 : Récupération données boursières (yfinance)
+# -----------------------------
+tickers_to_try = ["STM", "STM.PA", "STMPA.PA"]  # on tente plusieurs variantes
+hist = None
+used_ticker = None
+
+for tkr in tickers_to_try:
+    try:
+        tk = yf.Ticker(tkr)
+        tmp = tk.history(period="5y")
+        if tmp is not None and not tmp.empty:
+            hist = tmp.copy()
+            used_ticker = tkr
+            break
+    except:
+        pass
+
+if hist is None or hist.empty:
+    print("⚠️ Données boursières indisponibles via Yahoo Finance. Utilisation d'un proxy (données simulées).")
+    dates = pd.date_range(start="2019-01-01", periods=60, freq="ME")
+    prices = np.linspace(20, 60, 60) + np.random.normal(0, 3, 60)
+    hist = pd.DataFrame({"Close": prices}, index=dates)
+    used_ticker = "PROXY"
+else:
+    print(f"✅ Données boursières récupérées via ticker : {used_ticker}")
+
+# Plot tendance boursière (couleurs)
+plt.figure(figsize=(12,5))
+plt.plot(hist.index, hist["Close"], linewidth=2)
+plt.title(f"STMicroelectronics – Tendance du cours (5 ans) | Ticker: {used_ticker}")
+plt.xlabel("Date")
+plt.ylabel("Cours de clôture")
+plt.show()
+
+
+# -----------------------------
+# Section 3 : Revenus historiques (Income Statement via yfinance)
+# -----------------------------
+def get_revenue_history_from_yfinance(ticker_symbol: str):
+    """
+    Essaie plusieurs endpoints/attributs yfinance selon les versions.
+    Retourne une série annuelle de Revenus (index=année) en unités natives (souvent USD).
+    """
+    t = yf.Ticker(ticker_symbol)
+
+    # Méthode A (versions récentes) : income_stmt
+    try:
+        inc = getattr(t, "income_stmt", None)
+        if inc is not None and isinstance(inc, pd.DataFrame) and not inc.empty:
+            # inc: lignes = items, colonnes = dates
+            # Chercher 'Total Revenue' (ou équivalents)
+            candidates = [x for x in inc.index if str(x).lower() in ["total revenue", "totalrevenue", "revenuetotal"]]
+            if len(candidates) == 0:
+                # fallback : chercher une ligne contenant 'revenue'
+                candidates = [x for x in inc.index if "revenue" in str(x).lower()]
+            if len(candidates) > 0:
+                rev = inc.loc[candidates[0]].copy()
+                rev.index = pd.to_datetime(rev.index)
+                rev = rev.sort_index()
+                rev = rev[~rev.index.isna()]
+                rev_series = pd.Series(rev.values, index=rev.index.year, name="Revenue")
+                rev_series = rev_series[rev_series > 0].dropna()
+                return rev_series
+    except:
+        pass
+
+    # Méthode B (anciennes versions) : financials
+    try:
+        fin = t.financials  # annuel
+        if fin is not None and isinstance(fin, pd.DataFrame) and not fin.empty:
+            candidates = [x for x in fin.index if str(x).lower() in ["total revenue", "totalrevenue"]]
+            if len(candidates) == 0:
+                candidates = [x for x in fin.index if "revenue" in str(x).lower()]
+            if len(candidates) > 0:
+                rev = fin.loc[candidates[0]].copy()
+                rev.index = pd.to_datetime(rev.index)
+                rev = rev.sort_index()
+                rev_series = pd.Series(rev.values, index=rev.index.year, name="Revenue")
+                rev_series = rev_series[rev_series > 0].dropna()
+                return rev_series
+    except:
+        pass
+
+    return None
+
+
+rev_hist = None
+rev_ticker_used = None
+
+# On réutilise le ticker trouvé + alternatives
+revenue_tickers_try = [used_ticker] + [t for t in tickers_to_try if t != used_ticker]
+
+for tkr in revenue_tickers_try:
+    if tkr == "PROXY":
+        continue
+    s = get_revenue_history_from_yfinance(tkr)
+    if s is not None and len(s) >= 3:
+        rev_hist = s.copy()
+        rev_ticker_used = tkr
+        break
+
+if rev_hist is None:
+    print("⚠️ Revenus non disponibles via yfinance. Utilisation d'un exemple (à remplacer par tes données ST officielles).")
+    # Exemple (valeurs fictives) : remplace par CA annuel STMicroelectronics (rapport annuel / 10-K / URD)
+    rev_hist = pd.Series(
+        data=[9500, 10700, 12200, 16100, 17100, 13800],  # EXEMPLE
+        index=[2019, 2020, 2021, 2022, 2023, 2024],
+        name="Revenue"
+    )
+    rev_ticker_used = "EXEMPLE"
+else:
+    print(f"✅ Revenus récupérés via ticker : {rev_ticker_used}")
+
+display(pd.DataFrame(rev_hist).rename(columns={"Revenue": "Revenus (valeur brute Yahoo / exemple)"}))
+
+
+# -----------------------------
+# Section 4 : Prévision Revenus (3 scénarios)
+# -----------------------------
+# Hypothèse simple et robuste : on estime un CAGR sur l’historique,
+# puis on applique un ajustement scénario (pessimiste / neutre / optimiste).
+
+years_forward = 5
+last_year = int(rev_hist.index.max())
+last_revenue = float(rev_hist.loc[last_year])
+
+# CAGR sur la période dispo (du 1er au dernier point)
+first_year = int(rev_hist.index.min())
+first_revenue = float(rev_hist.loc[first_year])
+
+n_years = last_year - first_year
+if n_years <= 0 or first_revenue <= 0:
+    cagr = 0.05  # fallback
+else:
+    cagr = (last_revenue / first_revenue) ** (1 / n_years) - 1
+
+# Scénarios (ajuste si tu veux)
+# - Pessimiste : 60% du CAGR (et plancher)
+# - Neutre     : CAGR
+# - Optimiste  : 140% du CAGR (et plafond)
+pess_growth = max(-0.05, 0.60 * cagr)  # plancher -5%
+base_growth = cagr
+opt_growth  = min(0.25, 1.40 * cagr)   # plafond +25%
+
+future_years = list(range(last_year + 1, last_year + years_forward + 1))
+
+def project_revenue(start_value, growth, years):
+    vals = []
+    v = start_value
+    for _ in years:
+        v = v * (1 + growth)
+        vals.append(v)
+    return np.array(vals)
+
+proj = pd.DataFrame({
+    "Année": future_years,
+    "Pessimiste": project_revenue(last_revenue, pess_growth, future_years),
+    "Neutre": project_revenue(last_revenue, base_growth, future_years),
+    "Optimiste": project_revenue(last_revenue, opt_growth, future_years),
+})
+
+print("\n## Hypothèses de croissance (issues de l’historique)")
+print(f"- Période historique utilisée : {first_year} → {last_year}")
+print(f"- CAGR estimé : {cagr:.2%}")
+print(f"- Croissance pessimiste : {pess_growth:.2%}")
+print(f"- Croissance neutre     : {base_growth:.2%}")
+print(f"- Croissance optimiste  : {opt_growth:.2%}")
+
+display(proj)
+
+# Plot prévisions (couleurs)
+plt.figure(figsize=(12,6))
+plt.plot(rev_hist.index, rev_hist.values, marker="o", linewidth=2, label="Historique")
+
+plt.plot(proj["Année"], proj["Pessimiste"], marker="o", linewidth=2, label="Prévision – Pessimiste")
+plt.plot(proj["Année"], proj["Neutre"], marker="o", linewidth=2, label="Prévision – Neutre")
+plt.plot(proj["Année"], proj["Optimiste"], marker="o", linewidth=2, label="Prévision – Optimiste")
+
+plt.title("STMicroelectronics – Revenus : historique + prévisions (3 scénarios)")
+plt.xlabel("Année")
+plt.ylabel("Revenus (unités brutes Yahoo / exemple)")
+plt.legend()
+plt.show()
+
+
+# -----------------------------
+# Section 5 : Porter – Five Forces (exemple structuré)
+# -----------------------------
+# Ajuste les scores selon TA lecture (1 faible → 10 fort)
+forces = {
+    "Pouvoir des fournisseurs": 7,     # wafers, équipements litho, matériaux
+    "Pouvoir des clients": 6,          # grands OEM auto/industriel, volumes
+    "Rivalité intra-sectorielle": 8,   # Infineon, NXP, TI, Renesas, etc.
+    "Menace des substituts": 4,        # techno substitution partielle
+    "Menace de nouveaux entrants": 3   # CAPEX / techno / barrières énormes
+}
+
+df_forces = pd.DataFrame({"Force": list(forces.keys()), "Score": list(forces.values())})
+
+plt.figure(figsize=(10,5))
+sns.barplot(data=df_forces, x="Force", y="Score", hue="Force", dodge=False, palette="viridis", legend=False)
+plt.title("Analyse de Porter – Five Forces (STMicroelectronics)")
+plt.ylabel("Impact (1-10)")
+plt.xticks(rotation=20, ha="right")
+plt.show()
+
+
+# -----------------------------
+# Section 6 : SWOT (WordCloud)
+# -----------------------------
+swot = {
+    "Forces": (
+        "Position forte dans les semi-conducteurs pour l'automobile et l'industriel, "
+        "portefeuille large (analog, power, MCU), intégration, R&D, présence mondiale"
+    ),
+    "Faiblesses": (
+        "Cyclicité du secteur, dépendance à certains segments, intensité capitalistique, "
+        "sensibilité aux disruptions supply chain"
+    ),
+    "Opportunités": (
+        "Électrification/VE, power electronics (SiC), industrial IoT, souveraineté européenne, "
+        "demande croissante en capteurs et microcontrôleurs"
+    ),
+    "Menaces": (
+        "Concurrence mondiale, pression sur les prix, risques géopolitiques, "
+        "évolutions technologiques rapides, tensions sur capacités et matériaux"
+    )
+}
+
+text_swot = " ".join(swot.values())
+wordcloud = WordCloud(width=1000, height=450, background_color="white").generate(text_swot)
+
+plt.figure(figsize=(14,6))
+plt.imshow(wordcloud, interpolation="bilinear")
+plt.axis("off")
+plt.title("SWOT – Nuage de mots (STMicroelectronics)")
+plt.show()
+
+
+# -----------------------------
+# Section 7 : Recommandations stratégiques (style 'cabinet')
+# -----------------------------
+print("## Recommandations stratégiques (format actionnable)")
+recommendations = [
+    "1) Renforcer l’avantage en Power & Auto : accélérer l’exécution sur SiC (capacité, rendement, partenariats) et sécuriser les contrats long terme.",
+    "2) Optimiser le mix produit : privilégier les segments à marge / différenciation (analog/power, capteurs, MCU auto-industriel) vs. commodités.",
+    "3) Résilience industrielle : dual-sourcing critique, diversification géographique, pilotage fin des stocks et scénarios de supply chain.",
+    "4) Discipline capitalistique : arbitrage CAPEX par ROIC attendu, phasage des investissements, et gouvernance de portefeuille projets.",
+    "5) Go-to-market : renforcer le co-développement avec OEM/Tier1, offres plateforme (hardware + software + support) pour augmenter switching costs.",
+    "6) Narratif ESG & souveraineté : aligner projets industriels et subventions/écosystèmes européens, avec reporting clair sur impacts et création de valeur."
+]
+for r in recommendations:
+    print(f"- {r}")
+
+
+# -----------------------------
+# Section 8 : Export (optionnel)
+# -----------------------------
+# Export CSV des prévisions
+proj.to_csv("stm_revenue_forecast_scenarios.csv", index=False)
+print("\n✅ Fichier exporté : stm_revenue_forecast_scenarios.csv (dans l'espace Colab)")
